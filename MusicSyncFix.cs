@@ -18,7 +18,7 @@ using UnityEngine;
 
 namespace PcStoreMusicSync;
 
-[BepInPlugin(Id, "PC Store Together Music Sync Fix", "1.2.0")]
+[BepInPlugin(Id, "PC Store Together Music Sync Fix", "1.2.1")]
 public sealed partial class MusicSyncFix : BaseUnityPlugin
 {
     private const string Id = "local.pcstore.musicsyncfix";

@@ -138,7 +138,17 @@ public sealed partial class MusicSyncFix
         Playback?.Offer(shop, new SharedTrack(owner, hash, bytes, format));
     }
 
-    private static void RememberLocalSelection(ShopTerminal __instance, long hash) => Playback?.Remember(__instance, hash);
+    private static void RememberLocalSelection(ShopTerminal __instance, long hash, int bytes, int format)
+    {
+        if (__instance.MusicReady && __instance.Runner.GameMode == GameMode.Shared && CoopPlayback.HasPeers(__instance.Runner) &&
+            (__instance.LocalUsesOs || (__instance.SharedStepPending && __instance.SharedOwner == __instance.Runner.LocalPlayer)) &&
+            new SharedTrack(__instance.Runner.LocalPlayer, hash, bytes, format).Valid)
+        {
+            Playback?.Remember(__instance, hash);
+            // Start the regular file transfer before waiting for a coordinated start.
+            __instance.RPC_OfferSong(hash, bytes, format);
+        }
+    }
 
     private static bool LoadPersonalClip(PersonalMusic __instance, string path, ref AudioClip __result)
     {
@@ -191,7 +201,8 @@ public sealed partial class MusicSyncFix
 
     private sealed class CoopPlayback : IDisposable
     {
-        private enum Control { Prepare = 1, Ready = 2, Cancel = 3 }
+        private enum Control { Received = 0, Prepare = 1, Ready = 2, Cancel = 3 }
+        private const float ResponseTimeout = 4.5f;
         private const float PrepareTimeout = 30f;
         private const float StartLead = 0.8f;
         private const float AutoLead = 4f;
@@ -229,11 +240,13 @@ public sealed partial class MusicSyncFix
             public PlayerRef Authority;
             public int Token;
             public int PreviousSong;
+            public float ResponseDeadline;
             public float Deadline;
             public float NextMessage;
             public float Length;
             public string Title;
             public float EarliestStart;
+            public readonly HashSet<PlayerRef> PreparingPeers = new HashSet<PlayerRef>();
             public readonly HashSet<PlayerRef> ReadyPeers = new HashSet<PlayerRef>();
         }
 
@@ -290,7 +303,7 @@ public sealed partial class MusicSyncFix
         public static bool HasPeers(NetworkRunner network)
         {
             foreach (PlayerRef player in network.ActivePlayers)
-                if (player != network.LocalPlayer)
+                if (player != PlayerRef.None && player != network.LocalPlayer)
                     return true;
 
             return false;
@@ -358,6 +371,9 @@ public sealed partial class MusicSyncFix
 
         public void Queue(SharedTrack track, float length, string title)
         {
+            if (pending != null && pending.Track.Hash == track.Hash && pending.Track.Owner == track.Owner)
+                return;
+
             bool auto = earlySong == terminal.SharedSong && terminal.MusicShared && terminal.SharedStepPending &&
                 terminal.SharedOwner == track.Owner && HasOffer && offered.Hash == track.Hash;
             ClearPending();
@@ -368,6 +384,7 @@ public sealed partial class MusicSyncFix
                 Authority = runner.LocalPlayer,
                 Token = unchecked(++nextToken) & 0xffff,
                 PreviousSong = terminal.SharedSong,
+                ResponseDeadline = Time.unscaledTime + ResponseTimeout,
                 Deadline = Time.unscaledTime + PrepareTimeout,
                 Length = length,
                 Title = title,
@@ -433,11 +450,14 @@ public sealed partial class MusicSyncFix
                 return;
 
             var fields = new ControlFields(flags, header);
-            if (fields.Type == Control.Ready && fields.Value == 0 && terminal.HasStateAuthority &&
+            if ((fields.Type == Control.Received || fields.Type == Control.Ready) && fields.Value == 0 && terminal.HasStateAuthority &&
                 SameRequest(hash, fields.Token) && (pending.PreviousSong & 7) == fields.PreviousSong &&
                 pending.Track.Owner.PlayerId == fields.Owner && TryFindOwner(sender.PlayerId, out PlayerRef active) && active == sender)
             {
-                pending.ReadyPeers.Add(sender);
+                if (pending.PreparingPeers.Add(sender))
+                    log.LogInfo($"Player {sender.PlayerId} accepted preparation for track {hash:x16}.");
+                if (fields.Type == Control.Ready && pending.ReadyPeers.Add(sender))
+                    log.LogInfo($"Player {sender.PlayerId} is ready for track {hash:x16}.");
                 return;
             }
 
@@ -453,13 +473,19 @@ public sealed partial class MusicSyncFix
                 return;
             }
 
-            if (fields.Type != Control.Prepare || SameRequest(hash, fields.Token) || (terminal.SharedSong & 7) != fields.PreviousSong ||
+            if (fields.Type != Control.Prepare || (terminal.SharedSong & 7) != fields.PreviousSong ||
                 !TryFindOwner(fields.Owner, out PlayerRef owner))
                 return;
 
             var track = new SharedTrack(owner, hash, fields.Value, fields.Format);
             if (!track.Valid)
                 return;
+
+            if (SameRequest(hash, fields.Token))
+            {
+                SendControl(Control.Received, pending);
+                return;
+            }
 
             ClearPending();
             notice = null;
@@ -472,6 +498,8 @@ public sealed partial class MusicSyncFix
                 Deadline = Time.unscaledTime + PrepareTimeout + RetryControl
             };
             ExpectTrack(music, owner, hash, track.Bytes, track.Format);
+            SendControl(Control.Received, pending);
+            log.LogInfo($"Waiting for shared start of track {hash:x16}.");
         }
 
         private bool SameRequest(long hash, int token) => pending != null && pending.Track.Hash == hash && pending.Token == token;
@@ -529,7 +557,7 @@ public sealed partial class MusicSyncFix
             }
 
             float now = Time.unscaledTime;
-            if (now >= pending.Deadline)
+            if (!terminal.HasStateAuthority && now >= pending.Deadline)
             {
                 CancelPending(timedOut: true);
                 return;
@@ -540,7 +568,7 @@ public sealed partial class MusicSyncFix
             bool send = now >= pending.NextMessage;
 
             if (terminal.HasStateAuthority)
-                TickAuthority(localReady, send);
+                TickAuthority(now, localReady, send);
             else if (localReady && send)
             {
                 pending.NextMessage = now + RetryControl;
@@ -548,38 +576,57 @@ public sealed partial class MusicSyncFix
             }
         }
 
-        private void TickAuthority(bool localReady, bool send)
+        private void TickAuthority(float now, bool localReady, bool send)
         {
             var request = pending;
+            bool peersResponded = true;
             bool peersReady = true;
             foreach (PlayerRef player in runner.ActivePlayers)
             {
-                if (player != runner.LocalPlayer && !request.ReadyPeers.Contains(player))
-                {
-                    peersReady = false;
-                    break;
-                }
-            }
-            if (!peersReady && send)
-            {
-                request.NextMessage = Time.unscaledTime + RetryControl;
-                SendControl(Control.Prepare, request, request.Track.Bytes);
+                if (player == PlayerRef.None || player == runner.LocalPlayer)
+                    continue;
+
+                peersResponded &= request.PreparingPeers.Contains(player);
+                peersReady &= request.ReadyPeers.Contains(player);
             }
 
             float? scheduled = ScheduleStart(localReady, peersReady, runner.SimulationTime, request.EarliestStart);
-            if (!scheduled.HasValue)
+            if (scheduled.HasValue)
+            {
+                Commit(request, scheduled);
                 return;
+            }
 
+            if (ShouldUseNormalPlayback(now, request.ResponseDeadline, request.Deadline, peersResponded, localReady && peersReady))
+            {
+                log.LogWarning($"Could not coordinate a shared start for track {request.Track.Hash:x16}. Starting regular playback.");
+                Commit(request, scheduled: null);
+                return;
+            }
+
+            if (!peersReady && send)
+            {
+                request.NextMessage = now + RetryControl;
+                SendControl(Control.Prepare, request, request.Track.Bytes);
+            }
+        }
+
+        private void Commit(PendingTrack request, float? scheduled)
+        {
             committing = request;
             try
             {
                 int previous = terminal.SharedSong;
                 ShareMethod.Invoke(terminal, new object[] { request.Track.Owner, request.Track.Hash, request.Track.Bytes, request.Track.Format, request.Length, request.Title });
-                if (terminal.SharedSong != previous)
+                if (terminal.SharedSong != previous && scheduled.HasValue)
                 {
                     float start = scheduled.Value;
                     WriteStartTime(terminal, start);
                     log.LogInfo($"All players prepared track {request.Track.Hash:x16}. Shared start at {start:F2}.");
+                }
+                else if (terminal.SharedSong == previous)
+                {
+                    log.LogWarning($"The game rejected track {request.Track.Hash:x16} during the switch.");
                 }
             }
             finally
@@ -588,6 +635,9 @@ public sealed partial class MusicSyncFix
                 ClearPending();
             }
         }
+
+        private static bool ShouldUseNormalPlayback(float now, float responseDeadline, float deadline, bool peersResponded, bool allReady) =>
+            !allReady && (now >= deadline || (!peersResponded && now >= responseDeadline));
 
         private static float? ScheduleStart(bool localReady, bool peersReady, float now, float earliest)
         {

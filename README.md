@@ -2,7 +2,7 @@
 
 Pick a song from **My Music** and the current track keeps playing while the new one loads. Once everyone in the shop is ready, the new track starts from 0:00 for everyone. The mod also prepares the next track in the background when the game offers it for autoplay.
 
-If a new track takes more than 30 seconds to prepare, the mod cancels the switch. You may hear a gap if the shop is quiet or the current track ends before the new one is ready. Players who join after a track has started catch up to its current position.
+If a player doesn't respond to the preparation request, or the track isn't ready after 30 seconds, the game starts it normally. Listeners still downloading the file join at the current playback position. You may hear a gap if the shop is quiet or the current track ends while the next one is loading.
 
 The mod removes the game's limit of ten different tracks per session. The **My Music** counter shows how many tracks are in your local library.
 
