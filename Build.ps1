@@ -25,7 +25,8 @@ $gameAssemblies = @(
     'mscorlib', 'System', 'System.Core', 'System.Memory', 'netstandard',
     'Assembly-CSharp', 'Fusion.Runtime', 'Fusion.Common', 'Fusion.Sockets',
     'UnityEngine', 'UnityEngine.CoreModule', 'UnityEngine.AudioModule', 'UnityEngine.UI',
-    'Unity.TextMeshPro', 'com.rlabrecque.steamworks.net'
+    'Unity.TextMeshPro', 'UnityEngine.UnityWebRequestModule', 'UnityEngine.UnityWebRequestAudioModule',
+    'com.rlabrecque.steamworks.net'
 )
 $dependencies = @($gameAssemblies | ForEach-Object { Join-Path $managed "$_.dll" })
 $dependencies += @('BepInEx', '0Harmony' | ForEach-Object { Join-Path $bepInEx "$_.dll" })
@@ -38,8 +39,8 @@ $references = foreach ($dependency in $dependencies) {
 
 New-Item -ItemType Directory -Path $output -Force | Out-Null
 $dll = Join-Path $output 'MusicSyncFix.dll'
-$source = Join-Path $PSScriptRoot 'MusicSyncFix.cs'
-dotnet $compiler /nologo /target:library /unsafe /optimize+ /deterministic /nostdlib+ /langversion:latest /warnaserror+ "/out:$dll" @references $source
+$sources = @('MusicSyncFix.cs', 'CoopPlayback.cs' | ForEach-Object { Join-Path $PSScriptRoot $_ })
+dotnet $compiler /nologo /target:library /unsafe /optimize+ /deterministic /nostdlib+ /langversion:latest /warnaserror+ "/out:$dll" @references @sources
 if ($LASTEXITCODE -ne 0) {
     throw "Compilation failed with exit code $LASTEXITCODE."
 }

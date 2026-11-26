@@ -18,8 +18,8 @@ using UnityEngine;
 
 namespace PcStoreMusicSync;
 
-[BepInPlugin(Id, "PC Store Together Music Sync Fix", "1.1.0")]
-public sealed class MusicSyncFix : BaseUnityPlugin
+[BepInPlugin(Id, "PC Store Together Music Sync Fix", "1.2.0")]
+public sealed partial class MusicSyncFix : BaseUnityPlugin
 {
     private const string Id = "local.pcstore.musicsyncfix";
     private const float RetrySeconds = 5f;
@@ -65,7 +65,8 @@ public sealed class MusicSyncFix : BaseUnityPlugin
             Patch(typeof(ShopTerminal), nameof(ShopTerminal.CanShare), prefix: nameof(AllowSharedTrack));
             Patch(typeof(MusicPlayerPanel), "ShowSource", postfix: nameof(ShowLibraryCount));
             Patch(typeof(PersonalMusic), "TickReceiving", prefix: nameof(PruneOldTransfers));
-            Logger.LogInfo("Music sync fix loaded. The per-session song limit is disabled.");
+            PatchPlayback();
+            Logger.LogInfo("Music sync fix loaded. Custom tracks can prepare in the background before a shared start.");
         }
         catch (Exception error)
         {
@@ -96,7 +97,7 @@ public sealed class MusicSyncFix : BaseUnityPlugin
     private static void Registered(PersonalMusic __instance)
     {
         ShopTerminal terminal = Terminal(__instance);
-        if (terminal != null && terminal.IsReady && terminal.Runner != null && terminal.Runner.GameMode == GameMode.Shared)
+        if (terminal != null && terminal.MusicReady && terminal.Runner != null && terminal.Runner.GameMode == GameMode.Shared)
             instance.transfer.Attach(__instance, terminal);
     }
 
@@ -200,7 +201,7 @@ public sealed class MusicSyncFix : BaseUnityPlugin
         foreach (DictionaryEntry entry in incoming)
         {
             long pending = (long)entry.Key;
-            if (pending != hash && !(bool)Done.GetValue(entry.Value))
+            if (pending != hash && pending != instance.transfer.Playback.PendingHash && !(bool)Done.GetValue(entry.Value))
                 abandoned.Add(pending);
         }
 
@@ -239,78 +240,86 @@ public sealed class MusicSyncFix : BaseUnityPlugin
         private readonly BepInEx.Logging.ManualLogSource log;
         private readonly IntPtr[] messages = new IntPtr[16];
         private readonly byte[] packet = new byte[HeaderSize + PartSize];
+        private readonly Dictionary<long, PartDownload> downloads = new Dictionary<long, PartDownload>();
         private Callback<SteamNetworkingMessagesSessionRequest_t> sessionRequests;
         private PersonalMusic music;
         private ShopTerminal terminal;
         private NetworkRunner runner;
         private CSteamID localId;
-        private CSteamID downloadPeer;
-        private int song = -1;
-        private int nextWindow;
-        private int lastMissing;
-        private float lastProgress;
-        private float nextRequest;
-        private bool failed;
         private bool disabled;
 
-        public SteamMusicTransfer(BepInEx.Logging.ManualLogSource log) => this.log = log;
+        private sealed class PartDownload
+        {
+            public CSteamID Peer;
+            public int NextWindow;
+            public int LastMissing;
+            public float LastProgress;
+            public float NextRequest;
+            public bool Failed;
+        }
+
+        public SteamMusicTransfer(BepInEx.Logging.ManualLogSource log)
+        {
+            this.log = log;
+            Playback = new CoopPlayback(this, log);
+        }
+
+        public CoopPlayback Playback { get; }
 
         public void Attach(PersonalMusic source, ShopTerminal shop)
         {
-            if (music == source && runner == shop.Runner)
+            if (music == source && runner == shop.Runner && Playback.Manages(source))
                 return;
 
             music = source;
             terminal = shop;
             runner = shop.Runner;
-            song = -1;
-            downloadPeer = default;
+            downloads.Clear();
+            Playback.Attach(source, shop);
         }
 
         private bool Ready => !disabled && StoreSteam.Ready && terminal != null && runner != null &&
             runner.IsRunning && terminal.MusicReady;
 
+        public bool CanSend => Ready && sessionRequests != null;
+
         public bool TryDownload(PersonalMusic source, PlayerRef owner, long hash, int missing, int total, float now)
         {
-            if (sessionRequests == null || !Ready || source != music || !terminal.MusicShared || terminal.SharedHash != hash)
+            if (!CanSend || source != music || !Playback.TryTrack(hash, out var track) || track.Owner != owner)
                 return false;
 
-            if (song != terminal.SharedSong)
-            {
-                if (!TrySteamId(owner, out downloadPeer))
-                    return false;
-
-                song = terminal.SharedSong;
-                lastProgress = now;
-                nextRequest = now;
-                nextWindow = missing;
-                lastMissing = missing;
-                failed = false;
-            }
-
-            if (failed)
+            if (!TrySteamId(owner, out CSteamID peer))
                 return false;
 
-            if (missing != lastMissing)
+            if (!downloads.TryGetValue(hash, out PartDownload download) || download.Peer != peer)
             {
-                lastMissing = missing;
-                lastProgress = now;
+                download = new PartDownload { Peer = peer, LastProgress = now, NextRequest = now, NextWindow = missing, LastMissing = missing };
+                downloads[hash] = download;
             }
 
-            if (now - lastProgress >= 8f)
+            if (download.Failed)
+                return false;
+
+            if (missing != download.LastMissing)
             {
-                failed = true;
+                download.LastMissing = missing;
+                download.LastProgress = now;
+            }
+
+            if (now - download.LastProgress >= 8f)
+            {
+                download.Failed = true;
                 log.LogInfo($"Steam transfer stalled for song {hash:x16}. Resuming through the game transport.");
                 return false;
             }
 
-            if (missing >= nextWindow || now >= nextRequest)
+            if (missing >= download.NextWindow || now >= download.NextRequest)
             {
                 int count = Math.Min(Window, total - missing);
                 EResult result;
                 try
                 {
-                    result = Send(downloadPeer, Request, hash, missing, count, null, 0, 0);
+                    result = Send(peer, Request, hash, missing, count, null, 0, 0);
                 }
                 catch (Exception error)
                 {
@@ -318,8 +327,8 @@ public sealed class MusicSyncFix : BaseUnityPlugin
                     return false;
                 }
 
-                nextRequest = now + 2.5f;
-                nextWindow = missing + count;
+                download.NextRequest = now + 2.5f;
+                download.NextWindow = missing + count;
                 if (result != EResult.k_EResultOK)
                     log.LogDebug($"Steam music request returned {result}.");
             }
@@ -330,7 +339,10 @@ public sealed class MusicSyncFix : BaseUnityPlugin
         public void Poll()
         {
             if (!Ready)
+            {
+                Playback.Tick();
                 return;
+            }
 
             try
             {
@@ -357,6 +369,8 @@ public sealed class MusicSyncFix : BaseUnityPlugin
                         SteamNetworkingMessage_t.Release(messages[index]);
                     }
                 }
+
+                Playback.Tick();
             }
             catch (Exception error)
             {
@@ -370,7 +384,7 @@ public sealed class MusicSyncFix : BaseUnityPlugin
             log.LogWarning("Steam transfer unavailable. Using game transport: " + error.Message);
         }
 
-        private bool TrySteamId(PlayerRef player, out CSteamID steamId)
+        public bool TrySteamId(PlayerRef player, out CSteamID steamId)
         {
             steamId = default;
             if (player == PlayerRef.None || player == runner.LocalPlayer ||
@@ -399,7 +413,7 @@ public sealed class MusicSyncFix : BaseUnityPlugin
         private void ReadMessage(SteamNetworkingMessage_t message)
         {
             int size = message.m_cbSize;
-            if (size < HeaderSize || size > packet.Length || !terminal.MusicShared)
+            if (size < HeaderSize || size > packet.Length)
                 return;
 
             Marshal.Copy(message.m_pData, packet, 0, size);
@@ -407,14 +421,14 @@ public sealed class MusicSyncFix : BaseUnityPlugin
             long hash = BitConverter.ToInt64(packet, 4);
             int index = BitConverter.ToInt32(packet, 12);
             int count = BitConverter.ToInt32(packet, 16);
-            if (hash != terminal.SharedHash || index < 0 || index >= MaxParts)
+            CSteamID sender = message.m_identityPeer.GetSteamID();
+            if (index < 0 || index >= MaxParts || !Playback.TryTrack(hash, out var track))
                 return;
 
-            CSteamID sender = message.m_identityPeer.GetSteamID();
             if (type == Request && size == HeaderSize && count >= 1 && count <= Window &&
-                terminal.SharedOwner == runner.LocalPlayer && InCurrentShop(sender))
+                track.Owner == runner.LocalPlayer && InCurrentShop(sender))
             {
-                if (!OwnBytes(music).TryGetValue(hash, out byte[] bytes) || bytes.Length != terminal.SharedBytes)
+                if (!Playback.TryGetBytes(hash, out byte[] bytes) || bytes.Length != track.Bytes)
                     return;
 
                 int total = (bytes.Length + PartSize - 1) / PartSize;
@@ -425,19 +439,21 @@ public sealed class MusicSyncFix : BaseUnityPlugin
                         break;
                 }
             }
-            else if (type == Data && song == terminal.SharedSong && sender == downloadPeer &&
-                TrySteamId(terminal.SharedOwner, out CSteamID owner) && sender == owner &&
-                count == (terminal.SharedBytes + PartSize - 1) / PartSize && index < count)
+            else if (type == Data && downloads.TryGetValue(hash, out PartDownload download) && sender == download.Peer &&
+                TrySteamId(track.Owner, out CSteamID owner) && sender == owner &&
+                count == (track.Bytes + PartSize - 1) / PartSize && index < count)
             {
                 int length = size - HeaderSize;
-                if (length != Math.Min(PartSize, terminal.SharedBytes - index * PartSize))
+                if (length != Math.Min(PartSize, track.Bytes - index * PartSize))
                     return;
 
                 var data = new byte[length];
                 Buffer.BlockCopy(packet, HeaderSize, data, 0, length);
-                music.PartByRpc(runner.LocalPlayer, hash, index, count, terminal.SharedFormat, data);
+                music.PartByRpc(runner.LocalPlayer, hash, index, count, track.Format, data);
             }
         }
+
+        public void ForgetDownload(long hash) => downloads.Remove(hash);
 
         private unsafe EResult Send(CSteamID user, int type, long hash, int index, int count, byte[] data, int offset, int length)
         {
@@ -456,6 +472,10 @@ public sealed class MusicSyncFix : BaseUnityPlugin
             }
         }
 
-        public void Dispose() => sessionRequests?.Dispose();
+        public void Dispose()
+        {
+            Playback.Dispose();
+            sessionRequests?.Dispose();
+        }
     }
 }
