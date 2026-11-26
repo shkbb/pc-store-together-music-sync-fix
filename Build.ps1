@@ -24,7 +24,8 @@ $compiler = Join-Path $Matches[1] "$sdkVersion/Roslyn/bincore/csc.dll"
 $gameAssemblies = @(
     'mscorlib', 'System', 'System.Core', 'System.Memory', 'netstandard',
     'Assembly-CSharp', 'Fusion.Runtime', 'Fusion.Common', 'Fusion.Sockets',
-    'UnityEngine', 'UnityEngine.CoreModule', 'UnityEngine.AudioModule', 'com.rlabrecque.steamworks.net'
+    'UnityEngine', 'UnityEngine.CoreModule', 'UnityEngine.AudioModule', 'UnityEngine.UI',
+    'Unity.TextMeshPro', 'com.rlabrecque.steamworks.net'
 )
 $dependencies = @($gameAssemblies | ForEach-Object { Join-Path $managed "$_.dll" })
 $dependencies += @('BepInEx', '0Harmony' | ForEach-Object { Join-Path $bepInEx "$_.dll" })

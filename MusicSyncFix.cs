@@ -1,20 +1,24 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using BepInEx;
 using Fusion;
 using HarmonyLib;
 using PcStore.Audio;
 using PcStore.Frontend;
+using PcStore.Shop;
 using PcStore.World;
 using Steamworks;
+using TMPro;
 using UnityEngine;
 
 namespace PcStoreMusicSync;
 
-[BepInPlugin(Id, "PC Store Together Music Sync Fix", "1.0.0")]
+[BepInPlugin(Id, "PC Store Together Music Sync Fix", "1.1.0")]
 public sealed class MusicSyncFix : BaseUnityPlugin
 {
     private const string Id = "local.pcstore.musicsyncfix";
@@ -29,6 +33,11 @@ public sealed class MusicSyncFix : BaseUnityPlugin
         AccessTools.FieldRefAccess<PersonalMusic, Dictionary<long, byte[]>>("ownBytes");
     private static readonly AccessTools.FieldRef<PersonalMusic, Dictionary<(PlayerRef, long, int), float>> ServedAt =
         AccessTools.FieldRefAccess<PersonalMusic, Dictionary<(PlayerRef, long, int), float>>("servedAt");
+    private static readonly AccessTools.FieldRef<PersonalMusic, List<long>> IncomingKeys =
+        AccessTools.FieldRefAccess<PersonalMusic, List<long>>("incomingKeys");
+    private static readonly FieldInfo IncomingTransfers = AccessTools.Field(typeof(PersonalMusic), "incoming");
+    private static readonly ConditionalWeakTable<PersonalMusic, TrackTransferState> TrackTransfers =
+        new ConditionalWeakTable<PersonalMusic, TrackTransferState>();
 
     private static readonly Type Incoming = AccessTools.Inner(typeof(PersonalMusic), "Incoming");
     private static readonly FieldInfo Hash = AccessTools.Field(Incoming, "Hash");
@@ -39,6 +48,7 @@ public sealed class MusicSyncFix : BaseUnityPlugin
     private static readonly FieldInfo PartAt = AccessTools.Field(Incoming, "PartAt");
     private static readonly FieldInfo Stalls = AccessTools.Field(Incoming, "Stalls");
     private static readonly FieldInfo ViaRpc = AccessTools.Field(Incoming, "ViaRpc");
+    private static readonly FieldInfo Done = AccessTools.Field(Incoming, "Done");
 
     private void Awake()
     {
@@ -47,11 +57,15 @@ public sealed class MusicSyncFix : BaseUnityPlugin
         {
             transfer = new SteamMusicTransfer(Logger);
             instance = this;
-            Patch("Register", postfix: nameof(Registered));
-            Patch("TickIncoming", prefix: nameof(RequestMissingParts));
-            Patch(nameof(PersonalMusic.ServeParts), prefix: nameof(AllowRetry));
-            Patch(nameof(PersonalMusic.WillPlay), postfix: nameof(SilenceWhileReceiving));
-            Logger.LogInfo("Music sync fix loaded. Co-op playback uses the game's shared playback position.");
+            Patch(typeof(PersonalMusic), "Register", postfix: nameof(Registered));
+            Patch(typeof(PersonalMusic), "TickIncoming", prefix: nameof(RequestMissingParts));
+            Patch(typeof(PersonalMusic), nameof(PersonalMusic.ServeParts), prefix: nameof(AllowRetry));
+            Patch(typeof(PersonalMusic), nameof(PersonalMusic.WillPlay), postfix: nameof(SilenceWhileReceiving));
+            Patch(typeof(PersonalMusic), "Shareable", prefix: nameof(AllowLocalTrack));
+            Patch(typeof(ShopTerminal), nameof(ShopTerminal.CanShare), prefix: nameof(AllowSharedTrack));
+            Patch(typeof(MusicPlayerPanel), "ShowSource", postfix: nameof(ShowLibraryCount));
+            Patch(typeof(PersonalMusic), "TickReceiving", prefix: nameof(PruneOldTransfers));
+            Logger.LogInfo("Music sync fix loaded. The per-session song limit is disabled.");
         }
         catch (Exception error)
         {
@@ -61,10 +75,10 @@ public sealed class MusicSyncFix : BaseUnityPlugin
         }
     }
 
-    private void Patch(string method, string prefix = null, string postfix = null)
+    private void Patch(Type target, string method, string prefix = null, string postfix = null)
     {
-        MethodInfo original = AccessTools.DeclaredMethod(typeof(PersonalMusic), method)
-            ?? throw new MissingMethodException(typeof(PersonalMusic).FullName, method);
+        MethodInfo original = AccessTools.DeclaredMethod(target, method)
+            ?? throw new MissingMethodException(target.FullName, method);
         harmony.Patch(original,
             prefix: prefix == null ? null : new HarmonyMethod(typeof(MusicSyncFix), prefix),
             postfix: postfix == null ? null : new HarmonyMethod(typeof(MusicSyncFix), postfix));
@@ -144,6 +158,70 @@ public sealed class MusicSyncFix : BaseUnityPlugin
     {
         if (!__result && __instance.Receiving(out _) && Terminal(__instance).SharedHash == hash)
             __result = true;
+    }
+
+    private static bool AllowLocalTrack(ref bool __result)
+    {
+        __result = true;
+        return false;
+    }
+
+    private static bool AllowSharedTrack(long hash, ref bool __result)
+    {
+        // The game still validates the request and replicates the current song separately.
+        __result = hash != 0;
+        return false;
+    }
+
+    private static void ShowLibraryCount(PersonalMusic ___personal, TMP_Text ___libraryCount)
+    {
+        if (___libraryCount != null && ___personal != null && ___personal.ShowMine)
+        {
+            int count = ___personal.Count;
+            ___libraryCount.text = ShopOsText.F(count == 1 ? "os.music.songs1" : "os.music.songs", count);
+        }
+    }
+
+    private static void PruneOldTransfers(PersonalMusic __instance)
+    {
+        ShopTerminal terminal = Terminal(__instance);
+        if (terminal == null || !terminal.MusicReady)
+            return;
+
+        long hash = terminal.MusicShared ? terminal.SharedHash : 0;
+        TrackTransferState state = TrackTransfers.GetValue(__instance, _ => new TrackTransferState());
+        if (hash == state.Hash)
+            return;
+
+        state.Hash = hash;
+        var incoming = (IDictionary)IncomingTransfers.GetValue(__instance);
+        var abandoned = IncomingKeys(__instance);
+        abandoned.Clear();
+        foreach (DictionaryEntry entry in incoming)
+        {
+            long pending = (long)entry.Key;
+            if (pending != hash && !(bool)Done.GetValue(entry.Value))
+                abandoned.Add(pending);
+        }
+
+        foreach (long pending in abandoned)
+            incoming.Remove(pending);
+
+        var sent = ServedAt(__instance);
+        float now = Time.unscaledTime;
+        state.ExpiredParts.Clear();
+        foreach (var part in sent)
+            if (now - part.Value >= RetrySeconds)
+                state.ExpiredParts.Add(part.Key);
+
+        foreach (var part in state.ExpiredParts)
+            sent.Remove(part);
+    }
+
+    private sealed class TrackTransferState
+    {
+        public long Hash;
+        public readonly List<(PlayerRef, long, int)> ExpiredParts = new List<(PlayerRef, long, int)>();
     }
 
     private sealed class SteamMusicTransfer : IDisposable
